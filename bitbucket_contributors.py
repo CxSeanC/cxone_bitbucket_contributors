@@ -76,8 +76,12 @@ def sanitize_input(value):
     if not isinstance(value, str):
         return ""
     value = value.strip()
-    if any(c in value for c in ['..', '/', '\\', '\n', '\r']):
-        sys.exit("❌ Invalid characters detected in input.")
+    # Remove or replace problematic characters
+    value = value.replace('..', '')
+    value = value.replace('/', '_')
+    value = value.replace('\\', '_')
+    value = value.replace('\n', ' ')
+    value = value.replace('\r', '')
     return value
 
 def sanitize_csv(value):
