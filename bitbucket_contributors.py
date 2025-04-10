@@ -76,8 +76,12 @@ def sanitize_input(value):
     if not isinstance(value, str):
         return ""
     value = value.strip()
-    if any(c in value for c in ['..', '/', '\\', '\n', '\r']):
-        sys.exit("❌ Invalid characters detected in input.")
+    # Remove or replace problematic characters
+    value = value.replace('..', '')
+    value = value.replace('/', '_')
+    value = value.replace('\\', '_')
+    value = value.replace('\n', ' ')
+    value = value.replace('\r', '')
     return value
 
 def sanitize_csv(value):
@@ -158,6 +162,7 @@ def fetch_all_repositories(workspace, auth):
     return repos
 
 def fetch_commits(workspace, repo, auth, since_date):
+    # Use the Bitbucket query to filter by date. Note: this only returns the first page (100 commits).
     url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo}/commits?q=date>=\"{since_date}\"&pagelen=100"
     retries = 0
     while retries < 5:
@@ -172,25 +177,48 @@ def fetch_commits(workspace, repo, auth, since_date):
     print(f"[{repo}] ❌ Giving up after retries.")
     return []
 
-def process_repository(repo, workspace, auth, since_date, name_email_map, contributor_set, repo_user_map):
+def process_repository(repo, workspace, auth, since_date, name_email_map, contributor_set, repo_user_date_map):
     commits = fetch_commits(workspace, repo, auth, since_date)
     for commit in commits:
         raw_author = commit.get("author", {}).get("raw", "").strip()
         if not raw_author or re.search(r"\\[bot\\]|bot@|bot ", raw_author, re.IGNORECASE):
             continue
+
         match = re.match(r"^(.*?)(?:\s*<(.*?)>)?$", raw_author)
         if not match:
             continue
         name = sanitize_input(match.group(1).strip().lower())
+
+        # Filter out contributor names that start with a number to avoid usernames like "12439234..."
+        if not name or name[0].isdigit():
+            continue
+
         email = match.group(2)
         if email and "noreply" in email.lower():
             continue
+
         display = sanitize_csv(raw_author)
+        commit_date_full = commit.get("date", "")
+        commit_date_str = commit_date_full[:10] if commit_date_full else ""
+
+        # Ensure the commit is in the last 90 days (client-side fallback)
+        if not commit_date_str or commit_date_str < since_date:
+            continue
+
         with counter_lock:
+            # Track the unique contributor globally.
+            contributor_set.add(name)
+            # Map normalized name to display name.
             if name not in name_email_map:
                 name_email_map[name] = display
-            contributor_set.add(name)
-            repo_user_map[f"{workspace}/{repo}"].add(name)
+
+            repo_key = f"{workspace}/{repo}"
+            # Update the latest commit date for this contributor in this repository.
+            if name in repo_user_date_map[repo_key]:
+                if commit_date_str > repo_user_date_map[repo_key][name]:
+                    repo_user_date_map[repo_key][name] = commit_date_str
+            else:
+                repo_user_date_map[repo_key][name] = commit_date_str
     return repo
 
 def main():
@@ -211,8 +239,9 @@ def main():
     since_date = (datetime.datetime.utcnow() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
 
     contributor_set = set()
-    repo_user_map = defaultdict(set)
     name_email_map = {}
+    # repo_user_date_map: repository -> {contributor: latest commit date}
+    repo_user_date_map = defaultdict(dict)
 
     repos = fetch_all_repositories(workspace, auth)
     if not repos:
@@ -221,24 +250,26 @@ def main():
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [
             executor.submit(process_repository, repo, workspace, auth, since_date,
-                            name_email_map, contributor_set, repo_user_map)
+                            name_email_map, contributor_set, repo_user_date_map)
             for repo in repos
         ]
         for future in as_completed(futures):
-            repo = future.result()
-            print(f"✅ Processed: {repo}")
+            processed_repo = future.result()
+            print(f"✅ Processed: {processed_repo}")
 
     with open("bitbucket_contributors.csv", mode="w", newline='', encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
+        # Summary table: repository and unique contributor count
         writer.writerow(["Repository", "Unique Contributor Count"])
-        for repo, users in sorted(repo_user_map.items()):
-            writer.writerow([sanitize_csv(repo), len(users)])
+        for repo, user_dates in sorted(repo_user_date_map.items()):
+            writer.writerow([sanitize_csv(repo), len(user_dates)])
         writer.writerow(["Total Unique Contributors", len(contributor_set)])
         writer.writerow([])
-        writer.writerow(["Repository", "Contributor Name"])
-        for repo, users in sorted(repo_user_map.items()):
-            for user in sorted(users):
-                writer.writerow([sanitize_csv(repo), sanitize_csv(name_email_map.get(user, user))])
+        # Detailed table: repository, contributor name, and latest commit date
+        writer.writerow(["Repository", "Contributor Name", "Latest Commit Date"])
+        for repo, user_dates in sorted(repo_user_date_map.items()):
+            for user, commit_date in sorted(user_dates.items()):
+                writer.writerow([sanitize_csv(repo), sanitize_csv(name_email_map.get(user, user)), commit_date])
         writer.writerow(["Total Unique Contributors", len(contributor_set)])
 
     print(f"\n✅ Report saved: bitbucket_contributors.csv")
